@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/schedule/operator"
 	"github.com/unrolled/render"
 )
 
@@ -39,11 +40,11 @@ func (h *operatorHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	regionID, err := strconv.ParseUint(id, 10, 64)
 	if err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+		h.r.JSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	op, err := h.GetOperator(regionID)
+	op, err := h.GetOperatorStatus(regionID)
 	if err != nil {
 		h.r.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -54,8 +55,8 @@ func (h *operatorHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *operatorHandler) List(w http.ResponseWriter, r *http.Request) {
 	var (
-		results []server.Operator
-		ops     []server.Operator
+		results []*operator.Operator
+		ops     []*operator.Operator
 		err     error
 	)
 
@@ -75,6 +76,8 @@ func (h *operatorHandler) List(w http.ResponseWriter, r *http.Request) {
 				ops, err = h.GetLeaderOperators()
 			case "region":
 				ops, err = h.GetRegionOperators()
+			case "waiting":
+				ops, err = h.GetWaitingOperators()
 			}
 			if err != nil {
 				h.r.JSON(w, http.StatusInternalServerError, err.Error())
@@ -89,14 +92,13 @@ func (h *operatorHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *operatorHandler) Post(w http.ResponseWriter, r *http.Request) {
 	var input map[string]interface{}
-	if err := readJSON(r.Body, &input); err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+	if err := readJSONRespondError(h.r, w, r.Body, &input); err != nil {
 		return
 	}
 
 	name, ok := input["name"].(string)
 	if !ok {
-		h.r.JSON(w, http.StatusInternalServerError, "missing operator name")
+		h.r.JSON(w, http.StatusBadRequest, "missing operator name")
 		return
 	}
 
@@ -155,6 +157,91 @@ func (h *operatorHandler) Post(w http.ResponseWriter, r *http.Request) {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+	case "add-peer":
+		regionID, ok := input["region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		storeID, ok := input["store_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "invalid store id to transfer peer to")
+			return
+		}
+		if err := h.AddAddPeerOperator(uint64(regionID), uint64(storeID)); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "add-learner":
+		regionID, ok := input["region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		storeID, ok := input["store_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "invalid store id to transfer peer to")
+			return
+		}
+		if err := h.AddAddLearnerOperator(uint64(regionID), uint64(storeID)); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "remove-peer":
+		regionID, ok := input["region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		storeID, ok := input["store_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "invalid store id to transfer peer to")
+			return
+		}
+		if err := h.AddRemovePeerOperator(uint64(regionID), uint64(storeID)); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "merge-region":
+		regionID, ok := input["source_region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		targetID, ok := input["target_region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "invalid target region id to merge to")
+			return
+		}
+		if err := h.AddMergeRegionOperator(uint64(regionID), uint64(targetID)); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "split-region":
+		regionID, ok := input["region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		policy, ok := input["policy"].(string)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing split policy")
+			return
+		}
+		if err := h.AddSplitRegionOperator(uint64(regionID), policy); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "scatter-region":
+		regionID, ok := input["region_id"].(float64)
+		if !ok {
+			h.r.JSON(w, http.StatusBadRequest, "missing region id")
+			return
+		}
+		if err := h.AddScatterRegionOperator(uint64(regionID)); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	default:
 		h.r.JSON(w, http.StatusBadRequest, "unknown operator")
 		return
@@ -168,7 +255,7 @@ func (h *operatorHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	regionID, err := strconv.ParseUint(id, 10, 64)
 	if err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+		h.r.JSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

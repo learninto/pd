@@ -44,8 +44,7 @@ func (h *schedulerHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 	var input map[string]interface{}
-	if err := readJSON(r.Body, &input); err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+	if err := readJSONRespondError(h.r, w, r.Body, &input); err != nil {
 		return
 	}
 
@@ -58,6 +57,55 @@ func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "balance-leader-scheduler":
 		if err := h.AddBalanceLeaderScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "balance-hot-region-scheduler":
+		if err := h.AddBalanceHotRegionScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "balance-region-scheduler":
+		if err := h.AddBalanceRegionScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "label-scheduler":
+		if err := h.AddLabelScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "scatter-range":
+		var args []string
+		startKey, ok := input["start_key"].(string)
+		if ok {
+			args = append(args, startKey)
+		}
+		endKey, ok := input["end_key"].(string)
+		if ok {
+			args = append(args, endKey)
+		}
+		name, ok := input["range_name"].(string)
+		if ok {
+			args = append(args, name)
+		}
+		if err := h.AddScatterRangeScheduler(args...); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+	case "balance-adjacent-region-scheduler":
+		var args []string
+		leaderLimit, ok := input["leader_limit"].(string)
+		if ok {
+			args = append(args, leaderLimit)
+		}
+		peerLimit, ok := input["peer_limit"].(string)
+		if ok {
+			args = append(args, peerLimit)
+		}
+
+		if err := h.AddAdjacentRegionScheduler(args...); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -88,6 +136,21 @@ func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 		}
 	case "shuffle-region-scheduler":
 		if err := h.AddShuffleRegionScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "random-merge-scheduler":
+		if err := h.AddRandomMergeScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "shuffle-hot-region-scheduler":
+		limit := uint64(1)
+		l, ok := input["limit"].(float64)
+		if ok {
+			limit = uint64(l)
+		}
+		if err := h.AddShuffleHotRegionScheduler(limit); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}

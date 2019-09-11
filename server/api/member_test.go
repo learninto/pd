@@ -15,27 +15,34 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/config"
 )
 
 var _ = Suite(&testMemberAPISuite{})
 
 type testMemberAPISuite struct {
-	hc *http.Client
+	hc      *http.Client
+	cfgs    []*config.Config
+	servers []*server.Server
+	clean   func()
 }
 
 func (s *testMemberAPISuite) SetUpSuite(c *C) {
 	s.hc = newHTTPClient()
+	s.cfgs, s.servers, s.clean = mustNewCluster(c, 3)
+}
+
+func (s *testMemberAPISuite) TearDownSuite(c *C) {
+	s.clean()
 }
 
 func relaxEqualStings(c *C, a, b []string) {
@@ -48,7 +55,7 @@ func relaxEqualStings(c *C, a, b []string) {
 	c.Assert(sortedStringA, Equals, sortedStringB)
 }
 
-func checkListResponse(c *C, body []byte, cfgs []*server.Config) {
+func checkListResponse(c *C, body []byte, cfgs []*config.Config) {
 	got := make(map[string][]*pdpb.Member)
 	json.Unmarshal(body, &got)
 
@@ -67,107 +74,19 @@ func checkListResponse(c *C, body []byte, cfgs []*server.Config) {
 }
 
 func (s *testMemberAPISuite) TestMemberList(c *C) {
-	numbers := []int{1, 3}
-
-	for _, num := range numbers {
-		cfgs, _, clean := mustNewCluster(c, num)
-		defer clean()
-
-		addr := cfgs[rand.Intn(len(cfgs))].ClientUrls + apiPrefix + "/api/v1/members"
+	for _, cfg := range s.cfgs {
+		addr := cfg.ClientUrls + apiPrefix + "/api/v1/members"
 		resp, err := s.hc.Get(addr)
 		c.Assert(err, IsNil)
 		buf, err := ioutil.ReadAll(resp.Body)
 		c.Assert(err, IsNil)
-		checkListResponse(c, buf, cfgs)
-	}
-}
-
-func (s *testMemberAPISuite) TestMemberDelete(c *C) {
-	cfgs, svrs, clean := mustNewCluster(c, 3)
-	defer clean()
-
-	target := rand.Intn(len(svrs))
-	server := svrs[target]
-
-	for i, cfg := range cfgs {
-		if cfg.Name == server.Name() {
-			cfgs = append(cfgs[:i], cfgs[i+1:]...)
-			break
-		}
-	}
-	for i, svr := range svrs {
-		if svr.Name() == server.Name() {
-			svrs = append(svrs[:i], svrs[i+1:]...)
-			break
-		}
-	}
-	clientURL := cfgs[rand.Intn(len(cfgs))].ClientUrls
-
-	server.Close()
-	time.Sleep(5 * time.Second)
-	mustWaitLeader(c, svrs)
-
-	var table = []struct {
-		name    string
-		checker Checker
-		status  int
-	}{
-		{
-			// delete a nonexistent pd
-			name:    fmt.Sprintf("test-%d", rand.Int63()),
-			checker: Equals,
-			status:  http.StatusNotFound,
-		},
-		{
-			// delete a pd randomly
-			name:    server.Name(),
-			checker: Equals,
-			status:  http.StatusOK,
-		},
-		{
-			// delete it again
-			name:    server.Name(),
-			checker: Equals,
-			status:  http.StatusNotFound,
-		},
-	}
-
-	for _, t := range table {
-		addr := clientURL + apiPrefix + "/api/v1/members/" + t.name
-		req, err := http.NewRequest("DELETE", addr, nil)
-		c.Assert(err, IsNil)
-		resp, err := s.hc.Do(req)
-		c.Assert(err, IsNil)
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusInternalServerError {
-			c.Assert(resp.StatusCode, t.checker, t.status)
-		}
-	}
-
-	for i := 0; i < 10; i++ {
-		addr := clientURL + apiPrefix + "/api/v1/members"
-		resp, err := s.hc.Get(addr)
-		c.Assert(err, IsNil)
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusInternalServerError {
-			time.Sleep(1)
-			continue
-		}
-		buf, err := ioutil.ReadAll(resp.Body)
-		c.Assert(err, IsNil)
-		checkListResponse(c, buf, cfgs)
+		checkListResponse(c, buf, s.cfgs)
 	}
 }
 
 func (s *testMemberAPISuite) TestMemberLeader(c *C) {
-	cfgs, svrs, clean := mustNewCluster(c, 3)
-	defer clean()
-
-	leader, err := svrs[0].GetLeader()
-	c.Assert(err, IsNil)
-
-	addr := cfgs[rand.Intn(len(cfgs))].ClientUrls + apiPrefix + "/api/v1/leader"
-	c.Assert(err, IsNil)
+	leader := s.servers[0].GetLeader()
+	addr := s.cfgs[rand.Intn(len(s.cfgs))].ClientUrls + apiPrefix + "/api/v1/leader"
 	resp, err := s.hc.Get(addr)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -175,7 +94,7 @@ func (s *testMemberAPISuite) TestMemberLeader(c *C) {
 	c.Assert(err, IsNil)
 
 	var got pdpb.Member
-	json.Unmarshal(buf, &got)
+	c.Assert(json.Unmarshal(buf, &got), IsNil)
 	c.Assert(got.GetClientUrls(), DeepEquals, leader.GetClientUrls())
 	c.Assert(got.GetMemberId(), Equals, leader.GetMemberId())
 }

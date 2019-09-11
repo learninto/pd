@@ -20,10 +20,16 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/coreos/pkg/capnslog"
-	"github.com/juju/errors"
+	zaplog "github.com/pingcap/log"
+	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/raft"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"google.golang.org/grpc/grpclog"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -92,7 +98,7 @@ func (rf *redirectFormatter) Flush() {}
 
 // isSKippedPackageName tests wether path name is on log library calling stack.
 func isSkippedPackageName(name string) bool {
-	return strings.Contains(name, "github.com/Sirupsen/logrus") ||
+	return strings.Contains(name, "github.com/sirupsen/logrus") ||
 		strings.Contains(name, "github.com/coreos/pkg/capnslog")
 }
 
@@ -102,7 +108,7 @@ type contextHook struct{}
 // Fire implements logrus.Hook interface
 // https://github.com/sirupsen/logrus/issues/63
 func (hook *contextHook) Fire(entry *log.Entry) error {
-	pc := make([]uintptr, 3)
+	pc := make([]uintptr, 4)
 	cnt := runtime.Callers(6, pc)
 
 	for i := 0; i < cnt; i++ {
@@ -123,7 +129,8 @@ func (hook *contextHook) Levels() []log.Level {
 	return log.AllLevels
 }
 
-func stringToLogLevel(level string) log.Level {
+// StringToLogLevel translates log level string to log level.
+func StringToLogLevel(level string) log.Level {
 	switch strings.ToLower(level) {
 	case "fatal":
 		return log.FatalLevel
@@ -139,7 +146,24 @@ func stringToLogLevel(level string) log.Level {
 	return defaultLogLevel
 }
 
-// textFormatter is for compatability with ngaut/log
+// StringToZapLogLevel translates log level string to log level.
+func StringToZapLogLevel(level string) zapcore.Level {
+	switch strings.ToLower(level) {
+	case "fatal":
+		return zapcore.FatalLevel
+	case "error":
+		return zapcore.ErrorLevel
+	case "warn", "warning":
+		return zapcore.WarnLevel
+	case "debug":
+		return zapcore.DebugLevel
+	case "info":
+		return zapcore.InfoLevel
+	}
+	return zapcore.InfoLevel
+}
+
+// textFormatter is for compatibility with ngaut/log
 type textFormatter struct {
 	DisableTimestamp bool
 }
@@ -168,7 +192,8 @@ func (f *textFormatter) Format(entry *log.Entry) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func stringToLogFormatter(format string, disableTimestamp bool) log.Formatter {
+// StringToLogFormatter uses the different log formatter according to a given format name.
+func StringToLogFormatter(format string, disableTimestamp bool) log.Formatter {
 	switch strings.ToLower(format) {
 	case "text":
 		return &textFormatter{
@@ -191,7 +216,7 @@ func stringToLogFormatter(format string, disableTimestamp bool) log.Formatter {
 }
 
 // InitFileLog initializes file based logging options.
-func InitFileLog(cfg *FileLogConfig) error {
+func InitFileLog(cfg *zaplog.FileLogConfig) error {
 	if st, err := os.Stat(cfg.Filename); err == nil {
 		if st.IsDir() {
 			return errors.New("can't use directory as log file name")
@@ -214,27 +239,58 @@ func InitFileLog(cfg *FileLogConfig) error {
 	return nil
 }
 
-// InitLogger initalizes PD's logger.
-func InitLogger(cfg *LogConfig) error {
-	log.SetLevel(stringToLogLevel(cfg.Level))
-	log.AddHook(&contextHook{})
+type wrapLogrus struct {
+	*log.Logger
+}
 
-	if cfg.Format == "" {
-		cfg.Format = defaultLogFormat
+// V provides the functionality that returns whether a particular log level is at
+// least l - this is needed to meet the LoggerV2 interface.  GRPC's logging levels
+// are: https://github.com/grpc/grpc-go/blob/master/grpclog/loggerv2.go#L71
+// 0=info, 1=warning, 2=error, 3=fatal
+// logrus's are: https://github.com/sirupsen/logrus/blob/master/logrus.go
+// 0=panic, 1=fatal, 2=error, 3=warn, 4=info, 5=debug
+func (lg *wrapLogrus) V(l int) bool {
+	// translate to logrus level
+	logrusLevel := 4 - l
+	return int(lg.Logger.Level) <= logrusLevel
+}
+
+var once sync.Once
+
+// InitLogger initializes PD's logger.
+func InitLogger(cfg *zaplog.Config) error {
+	var err error
+
+	once.Do(func() {
+		log.SetLevel(StringToLogLevel(cfg.Level))
+		log.AddHook(&contextHook{})
+
+		if cfg.Format == "" {
+			cfg.Format = defaultLogFormat
+		}
+		log.SetFormatter(StringToLogFormatter(cfg.Format, cfg.DisableTimestamp))
+
+		// etcd log
+		capnslog.SetFormatter(&redirectFormatter{})
+		// grpc log
+		lg := &wrapLogrus{log.StandardLogger()}
+		grpclog.SetLoggerV2(lg)
+		// raft log
+		raft.SetLogger(lg)
+
+		if len(cfg.File.Filename) == 0 {
+			return
+		}
+
+		err = InitFileLog(&cfg.File)
+	})
+	return err
+}
+
+// LogPanic logs the panic reason and stack, then exit the process.
+// Commonly used with a `defer`.
+func LogPanic() {
+	if e := recover(); e != nil {
+		zaplog.Fatal("panic", zap.Reflect("recover", e))
 	}
-	log.SetFormatter(stringToLogFormatter(cfg.Format, cfg.DisableTimestamp))
-
-	// etcd log
-	capnslog.SetFormatter(&redirectFormatter{})
-
-	if len(cfg.File.Filename) == 0 {
-		return nil
-	}
-
-	err := InitFileLog(&cfg.File)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	return nil
 }

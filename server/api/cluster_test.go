@@ -20,17 +20,18 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/config"
 )
 
-var _ = Suite(&testClusterInfo{})
+var _ = Suite(&testCluster{})
 
-type testClusterInfo struct {
+type testCluster struct {
 	svr       *server.Server
 	cleanup   cleanUpFunc
 	urlPrefix string
 }
 
-func (s *testClusterInfo) SetUpSuite(c *C) {
+func (s *testCluster) SetUpSuite(c *C) {
 	s.svr, s.cleanup = mustNewServer(c)
 	mustWaitLeader(c, []*server.Server{s.svr})
 
@@ -38,19 +39,19 @@ func (s *testClusterInfo) SetUpSuite(c *C) {
 	s.urlPrefix = fmt.Sprintf("%s%s/api/v1", addr, apiPrefix)
 }
 
-func (s *testClusterInfo) TearDownSuite(c *C) {
+func (s *testCluster) TearDownSuite(c *C) {
 	s.cleanup()
 }
 
-func (s *testClusterInfo) TestCluster(c *C) {
+func (s *testCluster) TestCluster(c *C) {
 	url := fmt.Sprintf("%s/cluster", s.urlPrefix)
 	c1 := &metapb.Cluster{}
 	err := readJSONWithURL(url, c1)
 	c.Assert(err, IsNil)
 
 	c2 := &metapb.Cluster{}
-	r := server.ReplicationConfig{MaxReplicas: 6}
-	s.svr.SetReplicationConfig(r)
+	r := config.ReplicationConfig{MaxReplicas: 6}
+	c.Assert(s.svr.SetReplicationConfig(r), IsNil)
 	err = readJSONWithURL(url, c2)
 	c.Assert(err, IsNil)
 
@@ -58,14 +59,22 @@ func (s *testClusterInfo) TestCluster(c *C) {
 	c.Assert(c1, DeepEquals, c2)
 }
 
-func (s *testClusterInfo) TestGetClusterStatus(c *C) {
+func (s *testCluster) TestGetClusterStatus(c *C) {
 	url := fmt.Sprintf("%s/cluster/status", s.urlPrefix)
 	status := server.ClusterStatus{}
 	err := readJSONWithURL(url, &status)
+	c.Assert(err, IsNil)
 	c.Assert(status.RaftBootstrapTime.IsZero(), IsTrue)
+	c.Assert(status.IsInitialized, IsFalse)
 	now := time.Now()
 	mustBootstrapCluster(c, s.svr)
 	err = readJSONWithURL(url, &status)
 	c.Assert(err, IsNil)
 	c.Assert(status.RaftBootstrapTime.After(now), IsTrue)
+	c.Assert(status.IsInitialized, IsFalse)
+	s.svr.SetReplicationConfig(config.ReplicationConfig{MaxReplicas: 1})
+	err = readJSONWithURL(url, &status)
+	c.Assert(err, IsNil)
+	c.Assert(status.RaftBootstrapTime.After(now), IsTrue)
+	c.Assert(status.IsInitialized, IsTrue)
 }

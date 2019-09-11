@@ -19,8 +19,10 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/ngaut/log"
+	"github.com/pingcap/log"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/config"
+	"go.uber.org/zap"
 )
 
 const (
@@ -41,27 +43,27 @@ func newRedirector(s *server.Server) *redirector {
 }
 
 func (h *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
-	if h.s.IsLeader() {
+	if !h.s.IsClosed() && h.s.GetMember().IsLeader() {
 		next(w, r)
 		return
 	}
 
 	// Prevent more than one redirection.
 	if name := r.Header.Get(redirectorHeader); len(name) != 0 {
-		log.Errorf("redirect from %v, but %v is not leader", name, h.s.Name())
+		log.Error("redirect but server is not leader", zap.String("from", name), zap.String("server", h.s.Name()))
 		http.Error(w, errRedirectToNotLeader, http.StatusInternalServerError)
 		return
 	}
 
 	r.Header.Set(redirectorHeader, h.s.Name())
 
-	leader, err := h.s.GetLeader()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	leader := h.s.GetMember().GetLeader()
+	if leader == nil {
+		http.Error(w, "no leader", http.StatusServiceUnavailable)
 		return
 	}
 
-	urls, err := server.ParseUrls(strings.Join(leader.GetClientUrls(), ","))
+	urls, err := config.ParseUrls(strings.Join(leader.GetClientUrls(), ","))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -77,12 +79,10 @@ type customReverseProxies struct {
 
 func newCustomReverseProxies(urls []url.URL) *customReverseProxies {
 	p := &customReverseProxies{
-		client: &http.Client{},
+		client: dialClient,
 	}
 
-	for _, u := range urls {
-		p.urls = append(p.urls, u)
-	}
+	p.urls = append(p.urls, urls...)
 
 	return p
 }
@@ -95,21 +95,21 @@ func (p *customReverseProxies) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 		resp, err := p.client.Do(r)
 		if err != nil {
-			log.Error(err)
+			log.Error("request failed", zap.Error(err))
 			continue
 		}
 
 		b, err := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			log.Error(err)
+			log.Error("request failed", zap.Error(err))
 			continue
 		}
 
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if _, err := w.Write(b); err != nil {
-			log.Error(err)
+			log.Error("write failed", zap.Error(err))
 			continue
 		}
 
@@ -121,8 +121,20 @@ func (p *customReverseProxies) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
+		values := dst[k]
 		for _, v := range vv {
-			dst.Add(k, v)
+			if !contains(values, v) {
+				dst.Add(k, v)
+			}
 		}
 	}
+}
+
+func contains(s []string, x string) bool {
+	for _, n := range s {
+		if x == n {
+			return true
+		}
+	}
+	return false
 }

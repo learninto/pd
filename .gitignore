@@ -1,9 +1,12 @@
 bin
-/vendor
-_vendor/src/github.com/pingcap/pd
 *.iml
 .idea
 default.etcd
 default.pd
 *.swp
 .DS_Store
+tags
+/.retools/
+vendor
+default*
+*.bak

@@ -14,46 +14,41 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/juju/errors"
-	"github.com/pingcap/kvproto/pkg/pdpb"
-	"golang.org/x/net/context"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/pkg/logutil"
+	"github.com/pingcap/pd/server/checker"
+	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/server/namespace"
+	"github.com/pingcap/pd/server/schedule"
+	"github.com/pingcap/pd/server/schedule/operator"
+	"github.com/pingcap/pd/server/statistics"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
 )
 
 const (
 	runSchedulerCheckInterval = 3 * time.Second
 	collectFactor             = 0.8
-	historiesCacheSize        = 1000
-	eventsCacheSize           = 1000
+	collectTimeout            = 5 * time.Minute
 	maxScheduleRetries        = 10
-	maxScheduleInterval       = time.Minute
-	minScheduleInterval       = time.Millisecond * 10
-	minSlowScheduleInterval   = time.Second * 3
-	scheduleIntervalFactor    = 1.3
 
-	writeStatLRUMaxLen            = 1000
-	storeHotRegionsDefaultLen     = 100
-	hotRegionLimitFactor          = 0.75
-	hotRegionScheduleFactor       = 0.9
-	hotRegionMinWriteRate         = 16 * 1024
-	regionHeartBeatReportInterval = 60
-	regionheartbeatSendChanCap    = 1024
-	storeHeartBeatReportInterval  = 10
-	minHotRegionReportInterval    = 3
-	hotRegionAntiCount            = 1
-	hotRegionScheduleName         = "balance-hot-region-scheduler"
+	regionheartbeatSendChanCap = 1024
+	hotRegionScheduleName      = "balance-hot-region-scheduler"
+
+	patrolScanRegionLimit = 128 // It takes about 14 minutes to iterate 1 million regions.
 )
 
 var (
-	hotRegionLowThreshold = 3
-	errSchedulerExisted   = errors.New("scheduler existed")
-	errSchedulerNotFound  = errors.New("scheduler not found")
+	errSchedulerExisted  = errors.New("scheduler existed")
+	errSchedulerNotFound = errors.New("scheduler not found")
 )
 
+// coordinator is used to manage all schedulers and checkers to decide if the region needs to be scheduled.
 type coordinator struct {
 	sync.RWMutex
 
@@ -61,101 +56,243 @@ type coordinator struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cluster    *clusterInfo
-	opt        *scheduleOption
-	limiter    *scheduleLimiter
-	checker    *replicaChecker
-	operators  map[uint64]Operator
-	schedulers map[string]*scheduleController
-
-	histories *lruCache
-	events    *fifoCache
-
-	hbStreams *heartbeatStreams
+	cluster          *RaftCluster
+	learnerChecker   *checker.LearnerChecker
+	replicaChecker   *checker.ReplicaChecker
+	namespaceChecker *checker.NamespaceChecker
+	mergeChecker     *checker.MergeChecker
+	regionScatterer  *schedule.RegionScatterer
+	schedulers       map[string]*scheduleController
+	opController     *schedule.OperatorController
+	classifier       namespace.Classifier
+	hbStreams        *heartbeatStreams
 }
 
-func newCoordinator(cluster *clusterInfo, opt *scheduleOption) *coordinator {
+// newCoordinator creates a new coordinator.
+func newCoordinator(cluster *RaftCluster, hbStreams *heartbeatStreams, classifier namespace.Classifier) *coordinator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &coordinator{
-		ctx:        ctx,
-		cancel:     cancel,
-		cluster:    cluster,
-		opt:        opt,
-		limiter:    newScheduleLimiter(),
-		checker:    newReplicaChecker(opt, cluster),
-		operators:  make(map[uint64]Operator),
-		schedulers: make(map[string]*scheduleController),
-		histories:  newLRUCache(historiesCacheSize),
-		events:     newFifoCache(eventsCacheSize),
-		hbStreams:  newHeartbeatStreams(ctx, cluster.getClusterID()),
+		ctx:              ctx,
+		cancel:           cancel,
+		cluster:          cluster,
+		learnerChecker:   checker.NewLearnerChecker(),
+		replicaChecker:   checker.NewReplicaChecker(cluster, classifier),
+		namespaceChecker: checker.NewNamespaceChecker(cluster, classifier),
+		mergeChecker:     checker.NewMergeChecker(cluster, classifier),
+		regionScatterer:  schedule.NewRegionScatterer(cluster, classifier),
+		schedulers:       make(map[string]*scheduleController),
+		opController:     schedule.NewOperatorController(cluster, hbStreams),
+		classifier:       classifier,
+		hbStreams:        hbStreams,
 	}
 }
 
-func (c *coordinator) dispatch(region *RegionInfo) {
-	// Check existed operator.
-	if op := c.getOperator(region.GetId()); op != nil {
-		res, finished := op.Do(region)
-		if !finished {
-			collectOperatorCounterMetrics(op)
-			if res != nil {
-				c.hbStreams.sendMsg(region, res)
-			}
+// patrolRegions is used to scan regions.
+// The checkers will check these regions to decide if they need to do some operations.
+func (c *coordinator) patrolRegions() {
+	defer logutil.LogPanic()
+
+	defer c.wg.Done()
+	timer := time.NewTimer(c.cluster.GetPatrolRegionInterval())
+	defer timer.Stop()
+
+	log.Info("coordinator starts patrol regions")
+	start := time.Now()
+	var key []byte
+	for {
+		select {
+		case <-timer.C:
+			timer.Reset(c.cluster.GetPatrolRegionInterval())
+		case <-c.ctx.Done():
+			log.Info("patrol regions has been stopped")
 			return
 		}
-		c.removeOperator(op)
+
+		regions := c.cluster.ScanRegions(key, nil, patrolScanRegionLimit)
+		if len(regions) == 0 {
+			// Resets the scan key.
+			key = nil
+			continue
+		}
+
+		for _, region := range regions {
+			// Skips the region if there is already a pending operator.
+			if c.opController.GetOperator(region.GetID()) != nil {
+				continue
+			}
+
+			key = region.GetEndKey()
+
+			if c.checkRegion(region) {
+				break
+			}
+		}
+		// Updates the label level isolation statistics.
+		c.cluster.updateRegionsLabelLevelStats(regions)
+		if len(key) == 0 {
+			patrolCheckRegionsHistogram.Observe(time.Since(start).Seconds())
+			start = time.Now()
+		}
+	}
+}
+
+// drivePushOperator is used to push the unfinished operator to the excutor.
+func (c *coordinator) drivePushOperator() {
+	defer logutil.LogPanic()
+
+	defer c.wg.Done()
+	log.Info("coordinator begins to actively drive push operator")
+	ticker := time.NewTicker(schedule.PushOperatorTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			log.Info("drive push operator has been stopped")
+			return
+		case <-ticker.C:
+			c.opController.PushOperators()
+		}
+	}
+}
+
+func (c *coordinator) checkRegion(region *core.RegionInfo) bool {
+	// If PD has restarted, it need to check learners added before and promote them.
+	// Don't check isRaftLearnerEnabled cause it maybe disable learner feature but there are still some learners to promote.
+	opController := c.opController
+
+	if op := c.learnerChecker.Check(region); op != nil {
+		if opController.AddOperator(op) {
+			return true
+		}
 	}
 
-	// Check replica operator.
-	if c.limiter.operatorCount(RegionKind) >= c.opt.GetReplicaScheduleLimit() {
-		return
+	if opController.OperatorCount(operator.OpLeader) < c.cluster.GetLeaderScheduleLimit() &&
+		opController.OperatorCount(operator.OpRegion) < c.cluster.GetRegionScheduleLimit() &&
+		opController.OperatorCount(operator.OpReplica) < c.cluster.GetReplicaScheduleLimit() {
+		if op := c.namespaceChecker.Check(region); op != nil {
+			if opController.AddWaitingOperator(op) {
+				return true
+			}
+		}
 	}
-	if op := c.checker.Check(region); op != nil {
-		c.addOperator(op)
+
+	if opController.OperatorCount(operator.OpReplica) < c.cluster.GetReplicaScheduleLimit() {
+		if op := c.replicaChecker.Check(region); op != nil {
+			if opController.AddWaitingOperator(op) {
+				return true
+			}
+		}
 	}
+	if c.cluster.IsFeatureSupported(RegionMerge) && opController.OperatorCount(operator.OpMerge) < c.cluster.GetMergeScheduleLimit() {
+		if ops := c.mergeChecker.Check(region); ops != nil {
+			// It makes sure that two operators can be added successfully altogether.
+			if opController.AddWaitingOperator(ops...) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *coordinator) run() {
 	ticker := time.NewTicker(runSchedulerCheckInterval)
 	defer ticker.Stop()
-	log.Info("coordinator: Start collect cluster information")
+	log.Info("coordinator starts to collect cluster information")
 	for {
 		if c.shouldRun() {
-			log.Info("coordinator: Cluster information is prepared")
+			log.Info("coordinator has finished cluster information preparation")
 			break
 		}
 		select {
 		case <-ticker.C:
 		case <-c.ctx.Done():
-			log.Info("coordinator: Stopped coordinator")
+			log.Info("coordinator stops running")
 			return
 		}
 	}
-	log.Info("coordinator: Run scheduler")
-	c.addScheduler(newBalanceLeaderScheduler(c.opt), minScheduleInterval)
-	c.addScheduler(newBalanceRegionScheduler(c.opt), minScheduleInterval)
-	c.addScheduler(newBalanceHotRegionScheduler(c.opt), minSlowScheduleInterval)
+	log.Info("coordinator starts to run schedulers")
+
+	k := 0
+	scheduleCfg := c.cluster.opt.Load().Clone()
+	for _, schedulerCfg := range scheduleCfg.Schedulers {
+		if schedulerCfg.Disable {
+			scheduleCfg.Schedulers[k] = schedulerCfg
+			k++
+			log.Info("skip create scheduler", zap.String("scheduler-type", schedulerCfg.Type))
+			continue
+		}
+		s, err := schedule.CreateScheduler(schedulerCfg.Type, c.opController, schedulerCfg.Args...)
+		if err != nil {
+			log.Error("can not create scheduler", zap.String("scheduler-type", schedulerCfg.Type), zap.Error(err))
+			continue
+		}
+		log.Info("create scheduler", zap.String("scheduler-name", s.GetName()))
+		if err = c.addScheduler(s, schedulerCfg.Args...); err != nil {
+			log.Error("can not add scheduler", zap.String("scheduler-name", s.GetName()), zap.Error(err))
+		}
+
+		// Only records the valid scheduler config.
+		if err == nil {
+			scheduleCfg.Schedulers[k] = schedulerCfg
+			k++
+		}
+	}
+
+	// Removes the invalid scheduler config and persist.
+	scheduleCfg.Schedulers = scheduleCfg.Schedulers[:k]
+	c.cluster.opt.Store(scheduleCfg)
+	if err := c.cluster.opt.Persist(c.cluster.storage); err != nil {
+		log.Error("cannot persist schedule config", zap.Error(err))
+	}
+
+	c.wg.Add(2)
+	// Starts to patrol regions.
+	go c.patrolRegions()
+	go c.drivePushOperator()
 }
 
 func (c *coordinator) stop() {
 	c.cancel()
-	c.wg.Wait()
 }
 
-func (c *coordinator) getHotWriteRegions() *StoreHotRegionInfos {
+// Hack to retrieve info from scheduler.
+// TODO: remove it.
+type hasHotStatus interface {
+	GetHotReadStatus() *statistics.StoreHotRegionInfos
+	GetHotWriteStatus() *statistics.StoreHotRegionInfos
+}
+
+func (c *coordinator) getHotWriteRegions() *statistics.StoreHotRegionInfos {
 	c.RLock()
 	defer c.RUnlock()
 	s, ok := c.schedulers[hotRegionScheduleName]
 	if !ok {
 		return nil
 	}
-	return s.Scheduler.(*balanceHotRegionScheduler).GetStatus()
+	if h, ok := s.Scheduler.(hasHotStatus); ok {
+		return h.GetHotWriteStatus()
+	}
+	return nil
+}
+
+func (c *coordinator) getHotReadRegions() *statistics.StoreHotRegionInfos {
+	c.RLock()
+	defer c.RUnlock()
+	s, ok := c.schedulers[hotRegionScheduleName]
+	if !ok {
+		return nil
+	}
+	if h, ok := s.Scheduler.(hasHotStatus); ok {
+		return h.GetHotReadStatus()
+	}
+	return nil
 }
 
 func (c *coordinator) getSchedulers() []string {
 	c.RLock()
 	defer c.RUnlock()
 
-	var names []string
+	names := make([]string, 0, len(c.schedulers))
 	for name := range c.schedulers {
 		names = append(names, name)
 	}
@@ -167,47 +304,80 @@ func (c *coordinator) collectSchedulerMetrics() {
 	defer c.RUnlock()
 	for _, s := range c.schedulers {
 		var allowScheduler float64
+		// If the scheduler is not allowed to schedule, it will disappear in Grafana panel.
+		// See issue #1341.
 		if s.AllowSchedule() {
 			allowScheduler = 1
 		}
-		limit := float64(s.GetResourceLimit())
-
 		schedulerStatusGauge.WithLabelValues(s.GetName(), "allow").Set(allowScheduler)
-		schedulerStatusGauge.WithLabelValues(s.GetName(), "limit").Set(limit)
 	}
 }
 
 func (c *coordinator) collectHotSpotMetrics() {
 	c.RLock()
 	defer c.RUnlock()
+	// Collects hot write region metrics.
 	s, ok := c.schedulers[hotRegionScheduleName]
 	if !ok {
 		return
 	}
-	status := s.Scheduler.(*balanceHotRegionScheduler).GetStatus()
-	for storeID, stat := range status.AsPeer {
-		store := fmt.Sprintf("store_%d", storeID)
-		totalWriteBytes := float64(stat.WrittenBytes)
-		hotWriteRegionCount := float64(stat.RegionsCount)
+	stores := c.cluster.GetStores()
+	status := s.Scheduler.(hasHotStatus).GetHotWriteStatus()
+	for _, s := range stores {
+		storeAddress := s.GetAddress()
+		storeID := s.GetID()
+		storeLabel := fmt.Sprintf("%d", storeID)
+		stat, ok := status.AsPeer[storeID]
+		if ok {
+			totalWriteBytes := float64(stat.TotalFlowBytes)
+			hotWriteRegionCount := float64(stat.RegionsCount)
 
-		hotSpotStatusGauge.WithLabelValues(store, "total_written_bytes_as_peer").Set(totalWriteBytes)
-		hotSpotStatusGauge.WithLabelValues(store, "hot_write_region_as_peer").Set(hotWriteRegionCount)
-	}
-	for storeID, stat := range status.AsLeader {
-		store := fmt.Sprintf("store_%d", storeID)
-		totalWriteBytes := float64(stat.WrittenBytes)
-		hotWriteRegionCount := float64(stat.RegionsCount)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_written_bytes_as_peer").Set(totalWriteBytes)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_write_region_as_peer").Set(hotWriteRegionCount)
+		} else {
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_written_bytes_as_peer").Set(0)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_write_region_as_peer").Set(0)
+		}
 
-		hotSpotStatusGauge.WithLabelValues(store, "total_written_bytes_as_leader").Set(totalWriteBytes)
-		hotSpotStatusGauge.WithLabelValues(store, "hot_write_region_as_leader").Set(hotWriteRegionCount)
+		stat, ok = status.AsLeader[storeID]
+		if ok {
+			totalWriteBytes := float64(stat.TotalFlowBytes)
+			hotWriteRegionCount := float64(stat.RegionsCount)
+
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_written_bytes_as_leader").Set(totalWriteBytes)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_write_region_as_leader").Set(hotWriteRegionCount)
+		} else {
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_written_bytes_as_leader").Set(0)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_write_region_as_leader").Set(0)
+		}
 	}
+
+	// Collects hot read region metrics.
+	status = s.Scheduler.(hasHotStatus).GetHotReadStatus()
+	for _, s := range stores {
+		storeAddress := s.GetAddress()
+		storeID := s.GetID()
+		storeLabel := fmt.Sprintf("%d", storeID)
+		stat, ok := status.AsLeader[storeID]
+		if ok {
+			totalReadBytes := float64(stat.TotalFlowBytes)
+			hotReadRegionCount := float64(stat.RegionsCount)
+
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_read_bytes_as_leader").Set(totalReadBytes)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_read_region_as_leader").Set(hotReadRegionCount)
+		} else {
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "total_read_bytes_as_leader").Set(0)
+			hotSpotStatusGauge.WithLabelValues(storeAddress, storeLabel, "hot_read_region_as_leader").Set(0)
+		}
+	}
+
 }
 
 func (c *coordinator) shouldRun() bool {
 	return c.cluster.isPrepared()
 }
 
-func (c *coordinator) addScheduler(scheduler Scheduler, interval time.Duration) error {
+func (c *coordinator) addScheduler(scheduler schedule.Scheduler, args ...string) error {
 	c.Lock()
 	defer c.Unlock()
 
@@ -215,14 +385,16 @@ func (c *coordinator) addScheduler(scheduler Scheduler, interval time.Duration) 
 		return errSchedulerExisted
 	}
 
-	s := newScheduleController(c, scheduler, interval)
+	s := newScheduleController(c, scheduler)
 	if err := s.Prepare(c.cluster); err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	c.wg.Add(1)
 	go c.runScheduler(s)
 	c.schedulers[s.GetName()] = s
+	c.cluster.opt.AddSchedulerCfg(s.GetType(), args)
+
 	return nil
 }
 
@@ -236,11 +408,14 @@ func (c *coordinator) removeScheduler(name string) error {
 	}
 
 	s.Stop()
+	schedulerStatusGauge.WithLabelValues(name, "allow").Set(0)
 	delete(c.schedulers, name)
-	return nil
+
+	return c.cluster.opt.RemoveSchedulerCfg(name)
 }
 
 func (c *coordinator) runScheduler(s *scheduleController) {
+	defer logutil.LogPanic()
 	defer c.wg.Done()
 	defer s.Cleanup(c.cluster)
 
@@ -254,165 +429,39 @@ func (c *coordinator) runScheduler(s *scheduleController) {
 			if !s.AllowSchedule() {
 				continue
 			}
-			if op := s.Schedule(c.cluster); op != nil {
-				c.addOperator(op)
+			if op := s.Schedule(); op != nil {
+				c.opController.AddWaitingOperator(op...)
 			}
 
 		case <-s.Ctx().Done():
-			log.Infof("%v stopped: %v", s.GetName(), s.Ctx().Err())
+			log.Info("scheduler has been stopped",
+				zap.String("scheduler-name", s.GetName()),
+				zap.Error(s.Ctx().Err()))
 			return
 		}
 	}
 }
 
-func (c *coordinator) addOperator(op Operator) bool {
-	c.Lock()
-	defer c.Unlock()
-	regionID := op.GetRegionID()
-
-	log.Infof("[region %v] add operator: %+v", regionID, op)
-
-	if old, ok := c.operators[regionID]; ok {
-		if !isHigherPriorityOperator(op, old) {
-			log.Infof("[region %v] cancel add operator, old: %+v", regionID, old)
-			return false
-		}
-		log.Infof("[region %v] replace old operator: %+v", regionID, old)
-		old.SetState(OperatorReplaced)
-		c.removeOperatorLocked(old)
-	}
-
-	c.histories.add(regionID, op)
-	c.limiter.addOperator(op)
-	c.operators[regionID] = op
-
-	if region := c.cluster.getRegion(op.GetRegionID()); region != nil {
-		if msg, _ := op.Do(region); msg != nil {
-			c.hbStreams.sendMsg(region, msg)
-		}
-	}
-
-	collectOperatorCounterMetrics(op)
-	return true
-}
-
-func isHigherPriorityOperator(new Operator, old Operator) bool {
-	if new.GetResourceKind() == AdminKind {
-		return true
-	}
-	if new.GetResourceKind() == PriorityKind && old.GetResourceKind() != PriorityKind {
-		return true
-	}
-	return false
-}
-
-func (c *coordinator) removeOperator(op Operator) {
-	c.Lock()
-	defer c.Unlock()
-	c.removeOperatorLocked(op)
-}
-
-func (c *coordinator) removeOperatorLocked(op Operator) {
-	regionID := op.GetRegionID()
-	c.limiter.removeOperator(op)
-	delete(c.operators, regionID)
-
-	c.histories.add(regionID, op)
-	collectOperatorCounterMetrics(op)
-}
-
-func (c *coordinator) getOperator(regionID uint64) Operator {
-	c.RLock()
-	defer c.RUnlock()
-	return c.operators[regionID]
-}
-
-func (c *coordinator) getOperators() []Operator {
-	c.RLock()
-	defer c.RUnlock()
-
-	var operators []Operator
-	for _, op := range c.operators {
-		operators = append(operators, op)
-	}
-
-	return operators
-}
-
-func (c *coordinator) getHistories() []Operator {
-	c.RLock()
-	defer c.RUnlock()
-
-	var operators []Operator
-	for _, elem := range c.histories.elems() {
-		operators = append(operators, elem.value.(Operator))
-	}
-
-	return operators
-}
-
-func (c *coordinator) getHistoriesOfKind(kind ResourceKind) []Operator {
-	c.RLock()
-	defer c.RUnlock()
-
-	var operators []Operator
-	for _, elem := range c.histories.elems() {
-		op := elem.value.(Operator)
-		if op.GetResourceKind() == kind {
-			operators = append(operators, op)
-		}
-	}
-
-	return operators
-}
-
-type scheduleLimiter struct {
-	sync.RWMutex
-	counts map[ResourceKind]uint64
-}
-
-func newScheduleLimiter() *scheduleLimiter {
-	return &scheduleLimiter{
-		counts: make(map[ResourceKind]uint64),
-	}
-}
-
-func (l *scheduleLimiter) addOperator(op Operator) {
-	l.Lock()
-	defer l.Unlock()
-	l.counts[op.GetResourceKind()]++
-}
-
-func (l *scheduleLimiter) removeOperator(op Operator) {
-	l.Lock()
-	defer l.Unlock()
-	l.counts[op.GetResourceKind()]--
-}
-
-func (l *scheduleLimiter) operatorCount(kind ResourceKind) uint64 {
-	l.RLock()
-	defer l.RUnlock()
-	return l.counts[kind]
-}
-
+// scheduleController is used to manage a scheduler to schedule.
 type scheduleController struct {
-	Scheduler
-	opt          *scheduleOption
-	limiter      *scheduleLimiter
+	schedule.Scheduler
+	cluster      *RaftCluster
+	opController *schedule.OperatorController
+	classifier   namespace.Classifier
 	nextInterval time.Duration
-	minInterval  time.Duration
 	ctx          context.Context
 	cancel       context.CancelFunc
 }
 
-func newScheduleController(c *coordinator, s Scheduler, minInterval time.Duration) *scheduleController {
+// newScheduleController creates a new scheduleController.
+func newScheduleController(c *coordinator, s schedule.Scheduler) *scheduleController {
 	ctx, cancel := context.WithCancel(c.ctx)
 	return &scheduleController{
 		Scheduler:    s,
-		opt:          c.opt,
-		limiter:      c.limiter,
-		nextInterval: minInterval,
-		minInterval:  minInterval,
+		cluster:      c.cluster,
+		opController: c.opController,
+		nextInterval: s.GetMinInterval(),
+		classifier:   c.classifier,
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -426,136 +475,24 @@ func (s *scheduleController) Stop() {
 	s.cancel()
 }
 
-func (s *scheduleController) Schedule(cluster *clusterInfo) Operator {
+func (s *scheduleController) Schedule() []*operator.Operator {
 	for i := 0; i < maxScheduleRetries; i++ {
 		// If we have schedule, reset interval to the minimal interval.
-		if op := s.Scheduler.Schedule(cluster); op != nil {
-			s.nextInterval = s.minInterval
+		if op := scheduleByNamespace(s.cluster, s.classifier, s.Scheduler); op != nil {
+			s.nextInterval = s.Scheduler.GetMinInterval()
 			return op
 		}
 	}
-
-	// If we have no schedule, increase the interval exponentially.
-	s.nextInterval = minDuration(time.Duration(float64(s.nextInterval)*scheduleIntervalFactor), maxScheduleInterval)
-
+	s.nextInterval = s.Scheduler.GetNextInterval(s.nextInterval)
 	return nil
 }
 
+// GetInterval returns the interval of scheduling for a scheduler.
 func (s *scheduleController) GetInterval() time.Duration {
 	return s.nextInterval
 }
 
+// AllowSchedule returns if a scheduler is allowed to schedule.
 func (s *scheduleController) AllowSchedule() bool {
-	return s.limiter.operatorCount(s.GetResourceKind()) < s.GetResourceLimit()
-}
-
-func collectOperatorCounterMetrics(op Operator) {
-	regionOp, ok := op.(*regionOperator)
-	if !ok {
-		return
-	}
-	for _, op := range regionOp.Ops {
-		operatorCounter.WithLabelValues(op.GetName(), op.GetState().String()).Add(1)
-	}
-}
-
-type heartbeatStream interface {
-	Send(*pdpb.RegionHeartbeatResponse) error
-}
-
-type streamUpdate struct {
-	storeID uint64
-	stream  heartbeatStream
-}
-
-type heartbeatStreams struct {
-	ctx       context.Context
-	clusterID uint64
-	streams   map[uint64]heartbeatStream
-	msgCh     chan *pdpb.RegionHeartbeatResponse
-	streamCh  chan streamUpdate
-}
-
-func newHeartbeatStreams(ctx context.Context, clusterID uint64) *heartbeatStreams {
-	localCtx, _ := context.WithCancel(ctx)
-	hs := &heartbeatStreams{
-		ctx:       localCtx,
-		clusterID: clusterID,
-		streams:   make(map[uint64]heartbeatStream),
-		msgCh:     make(chan *pdpb.RegionHeartbeatResponse, regionheartbeatSendChanCap),
-		streamCh:  make(chan streamUpdate, 1),
-	}
-	go hs.run()
-	return hs
-}
-
-func (s *heartbeatStreams) run() {
-	for {
-		select {
-		case update := <-s.streamCh:
-			s.streams[update.storeID] = update.stream
-		case msg := <-s.msgCh:
-			storeID := msg.GetTargetPeer().GetStoreId()
-			if stream, ok := s.streams[storeID]; ok {
-				if err := stream.Send(msg); err != nil {
-					log.Errorf("[region %v] send heartbeat message fail: %v", msg.RegionId, err)
-					delete(s.streams, storeID)
-					regionHeartbeatCounter.WithLabelValues("push", "err")
-				} else {
-					regionHeartbeatCounter.WithLabelValues("push", "ok")
-				}
-			} else {
-				log.Debugf("[region %v] heartbeat stream not found for store %v, skip send message", msg.RegionId, storeID)
-				regionHeartbeatCounter.WithLabelValues("push", "skip")
-			}
-		case <-s.ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *heartbeatStreams) bindStream(storeID uint64, stream heartbeatStream) {
-	update := streamUpdate{
-		storeID: storeID,
-		stream:  stream,
-	}
-	select {
-	case s.streamCh <- update:
-	case <-s.ctx.Done():
-	}
-}
-
-func (s *heartbeatStreams) sendMsg(region *RegionInfo, msg *pdpb.RegionHeartbeatResponse) {
-	if region.Leader == nil {
-		return
-	}
-
-	msg.Header = &pdpb.ResponseHeader{ClusterId: s.clusterID}
-	msg.RegionId = region.GetId()
-	msg.RegionEpoch = region.GetRegionEpoch()
-	msg.TargetPeer = region.Leader
-
-	select {
-	case s.msgCh <- msg:
-	case <-s.ctx.Done():
-	}
-}
-
-func (s *heartbeatStreams) sendErr(region *RegionInfo, errType pdpb.ErrorType, errMsg string) {
-	regionHeartbeatCounter.WithLabelValues("report", "err")
-
-	msg := &pdpb.RegionHeartbeatResponse{
-		Header: &pdpb.ResponseHeader{
-			ClusterId: s.clusterID,
-			Error: &pdpb.Error{
-				Type:    errType,
-				Message: errMsg,
-			},
-		},
-	}
-
-	select {
-	case s.msgCh <- msg:
-	case <-s.ctx.Done():
-	}
+	return s.Scheduler.IsScheduleAllowed(s.cluster)
 }

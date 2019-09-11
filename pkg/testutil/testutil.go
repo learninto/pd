@@ -14,22 +14,54 @@
 package testutil
 
 import (
-	"fmt"
-	"net"
+	"os"
+	"strings"
+	"time"
 
-	log "github.com/Sirupsen/logrus"
+	check "github.com/pingcap/check"
+	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/pingcap/pd/server/config"
+	"google.golang.org/grpc"
 )
 
-// AllocTestURL allocates a local URL for testing.
-func AllocTestURL() string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
+const (
+	waitMaxRetry   = 200
+	waitRetrySleep = time.Millisecond * 100
+)
+
+// CheckFunc is a condition checker that passed to WaitUntil. Its implementation
+// may call c.Fatal() to abort the test, or c.Log() to add more information.
+type CheckFunc func(c *check.C) bool
+
+// WaitUntil repeatly evaluates f() for a period of time, util it returns true.
+func WaitUntil(c *check.C, f CheckFunc) {
+	c.Log("wait start")
+	for i := 0; i < waitMaxRetry; i++ {
+		if f(c) {
+			return
+		}
+		time.Sleep(waitRetrySleep)
 	}
-	addr := fmt.Sprintf("http://%s", l.Addr())
-	err = l.Close()
-	if err != nil {
-		log.Fatal(err)
+	c.Fatal("wait timeout")
+}
+
+// NewRequestHeader creates a new request header.
+func NewRequestHeader(clusterID uint64) *pdpb.RequestHeader {
+	return &pdpb.RequestHeader{
+		ClusterId: clusterID,
 	}
-	return addr
+}
+
+// MustNewGrpcClient must create a new grpc client.
+func MustNewGrpcClient(c *check.C, addr string) pdpb.PDClient {
+	conn, err := grpc.Dial(strings.TrimPrefix(addr, "http://"), grpc.WithInsecure())
+
+	c.Assert(err, check.IsNil)
+	return pdpb.NewPDClient(conn)
+}
+
+// CleanServer is used to clean data directory.
+func CleanServer(cfg *config.Config) {
+	// Clean data directory
+	os.RemoveAll(cfg.DataDir)
 }

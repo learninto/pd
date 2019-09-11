@@ -14,40 +14,67 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/signal"
 	"syscall"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/juju/errors"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/pingcap/log"
 	"github.com/pingcap/pd/pkg/logutil"
 	"github.com/pingcap/pd/pkg/metricutil"
 	"github.com/pingcap/pd/server"
 	"github.com/pingcap/pd/server/api"
+	"github.com/pingcap/pd/server/config"
+	"github.com/pingcap/pd/server/join"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+
+	// Register schedulers.
+	_ "github.com/pingcap/pd/server/schedulers"
+	// Register namespace classifiers.
+	_ "github.com/pingcap/pd/table"
 )
 
 func main() {
-	cfg := server.NewConfig()
+	cfg := config.NewConfig()
 	err := cfg.Parse(os.Args[1:])
 
 	if cfg.Version {
 		server.PrintPDInfo()
-		os.Exit(0)
+		exit(0)
 	}
+
+	defer logutil.LogPanic()
 
 	switch errors.Cause(err) {
 	case nil:
 	case flag.ErrHelp:
-		os.Exit(0)
+		exit(0)
 	default:
-		log.Fatalf("parse cmd flags error: %s\n", err)
+		log.Fatal("parse cmd flags error", zap.Error(err))
 	}
 
+	if cfg.ConfigCheck {
+		server.PrintConfigCheckMsg(cfg)
+		exit(0)
+	}
+
+	// New zap logger
+	err = cfg.SetupLogger()
+	if err == nil {
+		log.ReplaceGlobals(cfg.GetZapLogger(), cfg.GetZapLogProperties())
+	} else {
+		log.Fatal("initialize logger error", zap.Error(err))
+	}
+	// Flushing any buffered log entries
+	defer log.Sync()
+
+	// The old logger
 	err = logutil.InitLogger(&cfg.Log)
 	if err != nil {
-		log.Fatalf("initalize logger error: %s\n", err)
+		log.Fatal("initialize logger error", zap.Error(err))
 	}
 
 	server.LogPDInfo()
@@ -61,14 +88,17 @@ func main() {
 
 	metricutil.Push(&cfg.Metric)
 
-	err = server.PrepareJoinCluster(cfg)
+	err = join.PrepareJoinCluster(cfg)
 	if err != nil {
-		log.Fatal("join error ", err)
+		log.Fatal("join meet error", zap.Error(err))
 	}
-	svr := server.CreateServer(cfg)
-	err = svr.StartEtcd(api.NewHandler(svr))
+	svr, err := server.CreateServer(cfg, api.NewHandler)
 	if err != nil {
-		log.Fatalf("server start etcd failed - %v", errors.Trace(err))
+		log.Fatal("create server failed", zap.Error(err))
+	}
+
+	if err = server.InitHTTPClient(svr); err != nil {
+		log.Fatal("initial http client for api handler failed", zap.Error(err))
 	}
 
 	sc := make(chan os.Signal, 1)
@@ -78,15 +108,30 @@ func main() {
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
 
-	go svr.Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	var sig os.Signal
+	go func() {
+		sig = <-sc
+		cancel()
+	}()
 
-	sig := <-sc
+	if err := svr.Run(ctx); err != nil {
+		log.Fatal("run server failed", zap.Error(err))
+	}
+
+	<-ctx.Done()
+	log.Info("Got signal to exit", zap.String("signal", sig.String()))
+
 	svr.Close()
-	log.Infof("Got signal [%d] to exit.", sig)
 	switch sig {
 	case syscall.SIGTERM:
-		os.Exit(0)
+		exit(0)
 	default:
-		os.Exit(1)
+		exit(1)
 	}
+}
+
+func exit(code int) {
+	log.Sync()
+	os.Exit(code)
 }

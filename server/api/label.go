@@ -16,10 +16,11 @@ package api
 import (
 	"net/http"
 	"regexp"
+	"strings"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/pd/server"
+	"github.com/pkg/errors"
 	"github.com/unrolled/render"
 )
 
@@ -47,8 +48,8 @@ func (h *labelsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	for _, s := range stores {
 		ls := s.GetLabels()
 		for _, l := range ls {
-			if _, ok := m[l.Key+l.Value]; !ok {
-				m[l.Key+l.Value] = struct{}{}
+			if _, ok := m[strings.ToLower(l.Key+l.Value)]; !ok {
+				m[strings.ToLower(l.Key+l.Value)] = struct{}{}
 				labels = append(labels, l)
 			}
 		}
@@ -71,20 +72,21 @@ func (h *labelsHandler) GetStores(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stores := cluster.GetStores()
-	storesInfo := &storesInfo{
-		Stores: make([]*storeInfo, 0, len(stores)),
+	stores := cluster.GetMetaStores()
+	storesInfo := &StoresInfo{
+		Stores: make([]*StoreInfo, 0, len(stores)),
 	}
 
 	stores = filter.filter(stores)
 	for _, s := range stores {
-		store, status, err := cluster.GetStore(s.GetId())
-		if err != nil {
-			h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		storeID := s.GetId()
+		store := cluster.GetStore(storeID)
+		if store == nil {
+			h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 			return
 		}
 
-		storeInfo := newStoreInfo(store, status)
+		storeInfo := newStoreInfo(h.svr.GetScheduleConfig(), store)
 		storesInfo.Stores = append(storesInfo.Stores, storeInfo)
 	}
 	storesInfo.Count = len(storesInfo.Stores)
@@ -98,13 +100,14 @@ type storesLabelFilter struct {
 }
 
 func newStoresLabelFilter(name, value string) (*storesLabelFilter, error) {
-	keyPattern, err := regexp.Compile(name)
+	// add (?i) to set a case-insensitive flag
+	keyPattern, err := regexp.Compile("(?i)" + name)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.WithStack(err)
 	}
-	valuePattern, err := regexp.Compile(value)
+	valuePattern, err := regexp.Compile("(?i)" + value)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.WithStack(err)
 	}
 	return &storesLabelFilter{
 		keyPattern:   keyPattern,

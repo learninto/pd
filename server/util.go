@@ -14,92 +14,86 @@
 package server
 
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
 	"fmt"
 	"math/rand"
-	"net"
 	"net/http"
-	"reflect"
-	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/coreos/etcd/clientv3"
-	"github.com/golang/protobuf/proto"
-	"github.com/juju/errors"
-	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/pingcap/log"
 	"github.com/pingcap/pd/pkg/etcdutil"
-	"golang.org/x/net/context"
+	"github.com/pingcap/pd/pkg/typeutil"
+	"github.com/pingcap/pd/server/config"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/clientv3"
+	"go.uber.org/zap"
 )
 
 const (
-	requestTimeout  = etcdutil.DefaultRequestTimeout
-	slowRequestTime = etcdutil.DefaultSlowRequestTime
-
-	defaultLogTimeFormat = "2006/01/02 15:04:05"
-	defaultLogMaxSize    = 300 // MB
-	defaultLogMaxBackups = 3
-	defaultLogMaxAge     = 28 // days
-	defaultLogLevel      = log.InfoLevel
-
-	logDirMode = 0755
+	clientTimeout  = 3 * time.Second
+	requestTimeout = etcdutil.DefaultRequestTimeout
 )
 
 // Version information.
 var (
-	PDBuildTS = "None"
-	PDGitHash = "None"
+	PDReleaseVersion = "None"
+	PDBuildTS        = "None"
+	PDGitHash        = "None"
+	PDGitBranch      = "None"
 )
+
+// dialClient used to dail http request.
+var dialClient = &http.Client{
+	Timeout: clientTimeout,
+	Transport: &http.Transport{
+		DisableKeepAlives: true,
+	},
+}
 
 // LogPDInfo prints the PD version information.
 func LogPDInfo() {
-	log.Infof("Welcome to Placement Driver (PD).")
-	log.Infof("Version:")
-	log.Infof("Git Commit Hash: %s", PDGitHash)
-	log.Infof("UTC Build Time:  %s", PDBuildTS)
+	log.Info("Welcome to Placement Driver (PD)")
+	log.Info("PD", zap.String("release-version", PDReleaseVersion))
+	log.Info("PD", zap.String("git-hash", PDGitHash))
+	log.Info("PD", zap.String("git-branch", PDGitBranch))
+	log.Info("PD", zap.String("utc-build-time", PDBuildTS))
 }
 
 // PrintPDInfo prints the PD version information without log info.
 func PrintPDInfo() {
+	fmt.Println("Release Version:", PDReleaseVersion)
 	fmt.Println("Git Commit Hash:", PDGitHash)
+	fmt.Println("Git Branch:", PDGitBranch)
 	fmt.Println("UTC Build Time: ", PDBuildTS)
 }
 
-// A helper function to get value with key from etcd.
-// TODO: return the value revision for outer use.
-func getValue(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, error) {
-	resp, err := kvGet(c, key, opts...)
-	if err != nil {
-		return nil, errors.Trace(err)
+// PrintConfigCheckMsg prints the message about configuration checks.
+func PrintConfigCheckMsg(cfg *config.Config) {
+	if len(cfg.WarningMsgs) == 0 {
+		fmt.Println("config check successful")
+		return
 	}
 
-	if n := len(resp.Kvs); n == 0 {
-		return nil, nil
-	} else if n > 1 {
-		return nil, errors.Errorf("invalid get value resp %v, must only one", resp.Kvs)
+	for _, msg := range cfg.WarningMsgs {
+		fmt.Println(msg)
 	}
-
-	return resp.Kvs[0].Value, nil
 }
 
-// Return boolean to indicate whether the key exists or not.
-// TODO: return the value revision for outer use.
-func getProtoMsg(c *clientv3.Client, key string, msg proto.Message, opts ...clientv3.OpOption) (bool, error) {
-	value, err := getValue(c, key, opts...)
-	if err != nil {
-		return false, errors.Trace(err)
+// CheckPDVersion checks if PD needs to be upgraded.
+func CheckPDVersion(opt *config.ScheduleOption) {
+	pdVersion := *MinSupportedVersion(Base)
+	if PDReleaseVersion != "None" {
+		pdVersion = *MustParseVersion(PDReleaseVersion)
 	}
-	if value == nil {
-		return false, nil
+	clusterVersion := *opt.LoadClusterVersion()
+	log.Info("load cluster version", zap.Stringer("cluster-version", clusterVersion))
+	if pdVersion.LessThan(clusterVersion) {
+		log.Warn(
+			"PD version less than cluster version, please upgrade PD",
+			zap.String("PD-version", pdVersion.String()),
+			zap.String("cluster-version", clusterVersion.String()))
 	}
-
-	if err = proto.Unmarshal(value, msg); err != nil {
-		return false, errors.Trace(err)
-	}
-
-	return true, nil
 }
 
 func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
@@ -109,7 +103,7 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 	// Generate a random cluster ID.
 	ts := uint64(time.Now().Unix())
 	clusterID := (ts << 32) + uint64(rand.Uint32())
-	value := uint64ToBytes(clusterID)
+	value := typeutil.Uint64ToBytes(clusterID)
 
 	// Multiple PDs may try to init the cluster ID at the same time.
 	// Only one PD can commit this transaction, then other PDs can get
@@ -120,7 +114,7 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 		Else(clientv3.OpGet(key)).
 		Commit()
 	if err != nil {
-		return 0, errors.Trace(err)
+		return 0, errors.WithStack(err)
 	}
 
 	// Txn commits ok, return the generated cluster ID.
@@ -138,114 +132,14 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 		return 0, errors.Errorf("txn returns invalid range response: %v", resp)
 	}
 
-	return bytesToUint64(response.Kvs[0].Value)
-}
-
-func bytesToUint64(b []byte) (uint64, error) {
-	if len(b) != 8 {
-		return 0, errors.Errorf("invalid data, must 8 bytes, but %d", len(b))
-	}
-
-	return binary.BigEndian.Uint64(b), nil
-}
-
-func uint64ToBytes(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
-}
-
-// slowLogTxn wraps etcd transaction and log slow one.
-type slowLogTxn struct {
-	clientv3.Txn
-	cancel context.CancelFunc
-}
-
-func newSlowLogTxn(client *clientv3.Client) clientv3.Txn {
-	ctx, cancel := context.WithTimeout(client.Ctx(), requestTimeout)
-	return &slowLogTxn{
-		Txn:    client.Txn(ctx),
-		cancel: cancel,
-	}
-}
-
-func (t *slowLogTxn) If(cs ...clientv3.Cmp) clientv3.Txn {
-	return &slowLogTxn{
-		Txn:    t.Txn.If(cs...),
-		cancel: t.cancel,
-	}
-}
-
-func (t *slowLogTxn) Then(ops ...clientv3.Op) clientv3.Txn {
-	return &slowLogTxn{
-		Txn:    t.Txn.Then(ops...),
-		cancel: t.cancel,
-	}
-}
-
-// Commit implements Txn Commit interface.
-func (t *slowLogTxn) Commit() (*clientv3.TxnResponse, error) {
-	start := time.Now()
-	resp, err := t.Txn.Commit()
-	t.cancel()
-
-	cost := time.Now().Sub(start)
-	if cost > slowRequestTime {
-		log.Warnf("txn runs too slow, resp: %v, err: %v, cost: %s", resp, err, cost)
-	}
-	label := "success"
-	if err != nil {
-		label = "failed"
-	}
-	txnCounter.WithLabelValues(label).Inc()
-	txnDuration.WithLabelValues(label).Observe(cost.Seconds())
-
-	return resp, errors.Trace(err)
-}
-
-func sliceClone(strs []string) []string {
-	data := make([]string, 0, len(strs))
-	for _, str := range strs {
-		data = append(data, str)
-	}
-
-	return data
-}
-
-func rpcConnect(addr string) (net.Conn, error) {
-	req, err := http.NewRequest("GET", pdRPCPrefix, nil)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	urls, err := ParseUrls(addr)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	for _, url := range urls {
-		var conn net.Conn
-		conn, err = net.Dial("tcp", url.Host)
-
-		if err != nil {
-			continue
-		}
-		err = req.Write(conn)
-		if err != nil {
-			conn.Close()
-			continue
-		}
-		return conn, nil
-	}
-
-	return nil, errors.Errorf("connect to %s failed", addr)
+	return typeutil.BytesToUint64(response.Kvs[0].Value)
 }
 
 // GetMembers return a slice of Members.
 func GetMembers(etcdClient *clientv3.Client) ([]*pdpb.Member, error) {
 	listResp, err := etcdutil.ListEtcdMembers(etcdClient)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	members := make([]*pdpb.Member, 0, len(listResp.Members))
@@ -262,81 +156,19 @@ func GetMembers(etcdClient *clientv3.Client) ([]*pdpb.Member, error) {
 	return members, nil
 }
 
-func minUint64(a, b uint64) uint64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func maxUint64(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func diffRegionPeersInfo(origin *RegionInfo, other *RegionInfo) string {
-	var ret []string
-	for _, a := range origin.Peers {
-		both := false
-		for _, b := range other.Peers {
-			if reflect.DeepEqual(a, b) {
-				both = true
-				break
-			}
-		}
-		if !both {
-			ret = append(ret, fmt.Sprintf("Remove peer:{%v}", a))
-		}
-	}
-	for _, b := range other.Peers {
-		both := false
-		for _, a := range origin.Peers {
-			if reflect.DeepEqual(a, b) {
-				both = true
-				break
-			}
-		}
-		if !both {
-			ret = append(ret, fmt.Sprintf("Add peer:{%v}", b))
-		}
-	}
-	return strings.Join(ret, ",")
-}
-
-func diffRegionKeyInfo(origin *RegionInfo, other *RegionInfo) string {
-	var ret []string
-	if !bytes.Equal(origin.Region.StartKey, other.Region.StartKey) {
-		originKey := &metapb.Region{StartKey: origin.Region.StartKey}
-		otherKey := &metapb.Region{StartKey: other.Region.StartKey}
-		ret = append(ret, fmt.Sprintf("StartKey Changed:{%s} -> {%s}", originKey, otherKey))
-	}
-	if !bytes.Equal(origin.Region.EndKey, other.Region.EndKey) {
-		originKey := &metapb.Region{EndKey: origin.Region.EndKey}
-		otherKey := &metapb.Region{EndKey: other.Region.EndKey}
-		ret = append(ret, fmt.Sprintf("EndKey Changed:{%s} -> {%s}", originKey, otherKey))
-	}
-
-	return strings.Join(ret, ",")
-}
-
-func parseTimestamp(data []byte) (time.Time, error) {
-	nano, err := bytesToUint64(data)
+// InitHTTPClient initials a http client.
+func InitHTTPClient(svr *Server) error {
+	tlsConfig, err := svr.GetSecurityConfig().ToTLSConfig()
 	if err != nil {
-		return zeroTime, errors.Trace(err)
+		return err
 	}
 
-	return time.Unix(0, int64(nano)), nil
-}
-
-func subTimeByWallClock(after time.Time, before time.Time) time.Duration {
-	return time.Duration(after.UnixNano() - before.UnixNano())
+	dialClient = &http.Client{
+		Timeout: clientTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig:   tlsConfig,
+			DisableKeepAlives: true,
+		},
+	}
+	return nil
 }

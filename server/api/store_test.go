@@ -14,16 +14,19 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/core"
 )
 
 var _ = Suite(&testStoreSuite{})
@@ -35,30 +38,46 @@ type testStoreSuite struct {
 	stores    []*metapb.Store
 }
 
+func requestStatusBody(c *C, client *http.Client, method string, url string) (int, []byte) {
+	req, err := http.NewRequest(method, url, nil)
+	c.Assert(err, IsNil)
+	resp, err := client.Do(req)
+	c.Assert(err, IsNil)
+	body, err := ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	err = resp.Body.Close()
+	c.Assert(err, IsNil)
+	return resp.StatusCode, body
+}
+
 func (s *testStoreSuite) SetUpSuite(c *C) {
 	s.stores = []*metapb.Store{
 		{
 			// metapb.StoreState_Up == 0
 			Id:      1,
-			Address: "localhost:1",
+			Address: "tikv1",
 			State:   metapb.StoreState_Up,
+			Version: "2.0.0",
 		},
 		{
 			Id:      4,
-			Address: "localhost:4",
+			Address: "tikv4",
 			State:   metapb.StoreState_Up,
+			Version: "2.0.0",
 		},
 		{
 			// metapb.StoreState_Offline == 1
 			Id:      6,
-			Address: "localhost:6",
+			Address: "tikv6",
 			State:   metapb.StoreState_Offline,
+			Version: "2.0.0",
 		},
 		{
 			// metapb.StoreState_Tombstone == 2
 			Id:      7,
-			Address: "localhost:7",
+			Address: "tikv7",
 			State:   metapb.StoreState_Tombstone,
+			Version: "2.0.0",
 		},
 	}
 
@@ -69,8 +88,9 @@ func (s *testStoreSuite) SetUpSuite(c *C) {
 	s.urlPrefix = fmt.Sprintf("%s%s/api/v1", addr, apiPrefix)
 
 	mustBootstrapCluster(c, s.svr)
+
 	for _, store := range s.stores {
-		mustPutStore(c, s.svr, store)
+		mustPutStore(c, s.svr, store.Id, store.State, nil)
 	}
 }
 
@@ -78,7 +98,7 @@ func (s *testStoreSuite) TearDownSuite(c *C) {
 	s.cleanup()
 }
 
-func checkStoresInfo(c *C, ss []*storeInfo, want []*metapb.Store) {
+func checkStoresInfo(c *C, ss []*StoreInfo, want []*metapb.Store) {
 	c.Assert(len(ss), Equals, len(want))
 	mapWant := make(map[uint64]*metapb.Store)
 	for _, s := range want {
@@ -93,17 +113,19 @@ func checkStoresInfo(c *C, ss []*storeInfo, want []*metapb.Store) {
 
 func (s *testStoreSuite) TestStoresList(c *C) {
 	url := fmt.Sprintf("%s/stores", s.urlPrefix)
-	info := new(storesInfo)
+	info := new(StoresInfo)
 	err := readJSONWithURL(url, info)
 	c.Assert(err, IsNil)
 	checkStoresInfo(c, info.Stores, s.stores[:3])
 
 	url = fmt.Sprintf("%s/stores?state=0", s.urlPrefix)
+	info = new(StoresInfo)
 	err = readJSONWithURL(url, info)
 	c.Assert(err, IsNil)
 	checkStoresInfo(c, info.Stores, s.stores[:2])
 
 	url = fmt.Sprintf("%s/stores?state=1", s.urlPrefix)
+	info = new(StoresInfo)
 	err = readJSONWithURL(url, info)
 	c.Assert(err, IsNil)
 	checkStoresInfo(c, info.Stores, s.stores[2:3])
@@ -112,10 +134,67 @@ func (s *testStoreSuite) TestStoresList(c *C) {
 
 func (s *testStoreSuite) TestStoreGet(c *C) {
 	url := fmt.Sprintf("%s/store/1", s.urlPrefix)
-	info := new(storeInfo)
+	info := new(StoreInfo)
 	err := readJSONWithURL(url, info)
 	c.Assert(err, IsNil)
-	checkStoresInfo(c, []*storeInfo{info}, s.stores[:1])
+	checkStoresInfo(c, []*StoreInfo{info}, s.stores[:1])
+}
+
+func (s *testStoreSuite) TestStoreLabel(c *C) {
+	url := fmt.Sprintf("%s/store/1", s.urlPrefix)
+	var info StoreInfo
+	err := readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.Labels, HasLen, 0)
+
+	// Test merge.
+	// enable label match check.
+	labelCheck := map[string]string{"strictly-match-label": "true"}
+	lc, _ := json.Marshal(labelCheck)
+	err = postJSON(s.urlPrefix+"/config", lc)
+	c.Assert(err, IsNil)
+	// Test set.
+	labels := map[string]string{"zone": "cn", "host": "local"}
+	b, err := json.Marshal(labels)
+	c.Assert(err, IsNil)
+	err = postJSON(url+"/label", b)
+	c.Assert(strings.Contains(err.Error(), "key matching the label was not found"), IsTrue)
+	locationLabels := map[string]string{"location-labels": "zone,host"}
+	ll, _ := json.Marshal(locationLabels)
+	err = postJSON(s.urlPrefix+"/config", ll)
+	c.Assert(err, IsNil)
+	err = postJSON(url+"/label", b)
+	c.Assert(err, IsNil)
+
+	err = readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.Labels, HasLen, len(labels))
+	for _, l := range info.Store.Labels {
+		c.Assert(labels[l.Key], Equals, l.Value)
+	}
+
+	// Test merge.
+	// disable label match check.
+	labelCheck = map[string]string{"strictly-match-label": "false"}
+	lc, _ = json.Marshal(labelCheck)
+	err = postJSON(s.urlPrefix+"/config", lc)
+	c.Assert(err, IsNil)
+
+	labels = map[string]string{"zack": "zack1", "Host": "host1"}
+	b, err = json.Marshal(labels)
+	c.Assert(err, IsNil)
+	err = postJSON(url+"/label", b)
+	c.Assert(err, IsNil)
+
+	expectLabel := map[string]string{"zone": "cn", "zack": "zack1", "host": "host1"}
+	err = readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.Labels, HasLen, len(expectLabel))
+	for _, l := range info.Store.Labels {
+		c.Assert(expectLabel[l.Key], Equals, l.Value)
+	}
+
+	s.stores[0].Labels = info.Store.Labels
 }
 
 func (s *testStoreSuite) TestStoreDelete(c *C) {
@@ -129,19 +208,47 @@ func (s *testStoreSuite) TestStoreDelete(c *C) {
 		},
 		{
 			id:     7,
-			status: http.StatusInternalServerError,
+			status: http.StatusGone,
 		},
 	}
 	client := newHTTPClient()
 	for _, t := range table {
-		req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/store/%d", s.urlPrefix, t.id), nil)
-		c.Assert(err, IsNil)
-		resp, err := client.Do(req)
-		ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		c.Assert(err, IsNil)
-		c.Assert(resp.StatusCode, Equals, t.status)
+		url := fmt.Sprintf("%s/store/%d", s.urlPrefix, t.id)
+		status, _ := requestStatusBody(c, client, http.MethodDelete, url)
+		c.Assert(status, Equals, t.status)
 	}
+}
+
+func (s *testStoreSuite) TestStoreSetState(c *C) {
+	url := fmt.Sprintf("%s/store/1", s.urlPrefix)
+	info := StoreInfo{}
+	err := readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.State, Equals, metapb.StoreState_Up)
+
+	// Set to Offline.
+	info = StoreInfo{}
+	err = postJSON(url+"/state?state=Offline", nil)
+	c.Assert(err, IsNil)
+	err = readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.State, Equals, metapb.StoreState_Offline)
+
+	// Invalid state.
+	info = StoreInfo{}
+	err = postJSON(url+"/state?state=Foo", nil)
+	c.Assert(err, NotNil)
+	err = readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.State, Equals, metapb.StoreState_Offline)
+
+	// Set back to Up.
+	info = StoreInfo{}
+	err = postJSON(url+"/state?state=Up", nil)
+	c.Assert(err, IsNil)
+	err = readJSONWithURL(url, &info)
+	c.Assert(err, IsNil)
+	c.Assert(info.Store.State, Equals, metapb.StoreState_Up)
 }
 
 func (s *testStoreSuite) TestUrlStoreFilter(c *C) {
@@ -187,17 +294,21 @@ func (s *testStoreSuite) TestUrlStoreFilter(c *C) {
 }
 
 func (s *testStoreSuite) TestDownState(c *C) {
-	status := &server.StoreStatus{
-		StoreStats: &pdpb.StoreStats{},
-	}
-	store := &metapb.Store{
-		State: metapb.StoreState_Up,
-	}
-	status.LastHeartbeatTS = time.Now()
-	storeInfo := newStoreInfo(store, status)
+	store := core.NewStoreInfo(
+		&metapb.Store{
+			State: metapb.StoreState_Up,
+		},
+		core.SetStoreStats(&pdpb.StoreStats{}),
+		core.SetLastHeartbeatTS(time.Now()),
+	)
+	storeInfo := newStoreInfo(s.svr.GetScheduleConfig(), store)
 	c.Assert(storeInfo.Store.StateName, Equals, metapb.StoreState_Up.String())
 
-	status.LastHeartbeatTS = time.Now().Add(-time.Minute * 2)
-	storeInfo = newStoreInfo(store, status)
+	newStore := store.Clone(core.SetLastHeartbeatTS(time.Now().Add(-time.Minute * 2)))
+	storeInfo = newStoreInfo(s.svr.GetScheduleConfig(), newStore)
+	c.Assert(storeInfo.Store.StateName, Equals, disconnectedName)
+
+	newStore = store.Clone(core.SetLastHeartbeatTS(time.Now().Add(-time.Hour * 2)))
+	storeInfo = newStoreInfo(s.svr.GetScheduleConfig(), newStore)
 	c.Assert(storeInfo.Store.StateName, Equals, downStateName)
 }

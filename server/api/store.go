@@ -20,132 +20,196 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/juju/errors"
+	"github.com/pingcap/errcode"
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/pd/pkg/apiutil"
 	"github.com/pingcap/pd/pkg/typeutil"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/config"
+	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/server/schedule"
+	"github.com/pkg/errors"
 	"github.com/unrolled/render"
 )
 
-type metaStore struct {
+// MetaStore contains meta information about a store.
+type MetaStore struct {
 	*metapb.Store
 	StateName string `json:"state_name"`
 }
 
-type storeStatus struct {
-	StoreID            uint64            `json:"store_id"`
-	Capacity           typeutil.ByteSize `json:"capacity"`
-	Available          typeutil.ByteSize `json:"available"`
-	LeaderCount        int               `json:"leader_count"`
-	RegionCount        int               `json:"region_count"`
-	SendingSnapCount   uint32            `json:"sending_snap_count"`
-	ReceivingSnapCount uint32            `json:"receiving_snap_count"`
-	ApplyingSnapCount  uint32            `json:"applying_snap_count"`
-	IsBusy             bool              `json:"is_busy"`
-
-	StartTS         time.Time         `json:"start_ts"`
-	LastHeartbeatTS time.Time         `json:"last_heartbeat_ts"`
-	Uptime          typeutil.Duration `json:"uptime"`
+// StoreStatus contains status about a store.
+type StoreStatus struct {
+	Capacity           typeutil.ByteSize  `json:"capacity,omitempty"`
+	Available          typeutil.ByteSize  `json:"available,omitempty"`
+	LeaderCount        int                `json:"leader_count,omitempty"`
+	LeaderWeight       float64            `json:"leader_weight,omitempty"`
+	LeaderScore        float64            `json:"leader_score,omitempty"`
+	LeaderSize         int64              `json:"leader_size,omitempty"`
+	RegionCount        int                `json:"region_count,omitempty"`
+	RegionWeight       float64            `json:"region_weight,omitempty"`
+	RegionScore        float64            `json:"region_score,omitempty"`
+	RegionSize         int64              `json:"region_size,omitempty"`
+	SendingSnapCount   uint32             `json:"sending_snap_count,omitempty"`
+	ReceivingSnapCount uint32             `json:"receiving_snap_count,omitempty"`
+	ApplyingSnapCount  uint32             `json:"applying_snap_count,omitempty"`
+	IsBusy             bool               `json:"is_busy,omitempty"`
+	StartTS            *time.Time         `json:"start_ts,omitempty"`
+	LastHeartbeatTS    *time.Time         `json:"last_heartbeat_ts,omitempty"`
+	Uptime             *typeutil.Duration `json:"uptime,omitempty"`
 }
 
-type storeInfo struct {
-	Store  *metaStore   `json:"store"`
-	Status *storeStatus `json:"status"`
+// StoreInfo contains information about a store.
+type StoreInfo struct {
+	Store  *MetaStore   `json:"store"`
+	Status *StoreStatus `json:"status"`
 }
 
-const downStateName = "Down"
+const (
+	disconnectedName = "Disconnected"
+	downStateName    = "Down"
+)
 
-func newStoreInfo(store *metapb.Store, status *server.StoreStatus) *storeInfo {
-	s := &storeInfo{
-		Store: &metaStore{
-			Store:     store,
-			StateName: store.State.String(),
+func newStoreInfo(opt *config.ScheduleConfig, store *core.StoreInfo) *StoreInfo {
+	s := &StoreInfo{
+		Store: &MetaStore{
+			Store:     store.GetMeta(),
+			StateName: store.GetState().String(),
 		},
-		Status: &storeStatus{
-			StoreID:            status.StoreId,
-			Capacity:           typeutil.ByteSize(status.Capacity),
-			Available:          typeutil.ByteSize(status.Available),
-			LeaderCount:        status.LeaderCount,
-			RegionCount:        status.RegionCount,
-			SendingSnapCount:   status.SendingSnapCount,
-			ReceivingSnapCount: status.ReceivingSnapCount,
-			ApplyingSnapCount:  status.ApplyingSnapCount,
-			IsBusy:             status.IsBusy,
-			StartTS:            status.GetStartTS(),
-			LastHeartbeatTS:    status.LastHeartbeatTS,
-			Uptime:             typeutil.NewDuration(status.GetUptime()),
+		Status: &StoreStatus{
+			Capacity:           typeutil.ByteSize(store.GetCapacity()),
+			Available:          typeutil.ByteSize(store.GetAvailable()),
+			LeaderCount:        store.GetLeaderCount(),
+			LeaderWeight:       store.GetLeaderWeight(),
+			LeaderScore:        store.LeaderScore(0),
+			LeaderSize:         store.GetLeaderSize(),
+			RegionCount:        store.GetRegionCount(),
+			RegionWeight:       store.GetRegionWeight(),
+			RegionScore:        store.RegionScore(opt.HighSpaceRatio, opt.LowSpaceRatio, 0),
+			RegionSize:         store.GetRegionSize(),
+			SendingSnapCount:   store.GetSendingSnapCount(),
+			ReceivingSnapCount: store.GetReceivingSnapCount(),
+			ApplyingSnapCount:  store.GetApplyingSnapCount(),
+			IsBusy:             store.GetIsBusy(),
 		},
 	}
-	if store.State == metapb.StoreState_Up && status.IsDown() {
-		s.Store.StateName = downStateName
+
+	if store.GetStoreStats() != nil {
+		startTS := store.GetStartTS()
+		s.Status.StartTS = &startTS
+	}
+	if lastHeartbeat := store.GetLastHeartbeatTS(); !lastHeartbeat.IsZero() {
+		s.Status.LastHeartbeatTS = &lastHeartbeat
+	}
+	if upTime := store.GetUptime(); upTime > 0 {
+		duration := typeutil.NewDuration(upTime)
+		s.Status.Uptime = &duration
+	}
+
+	if store.GetState() == metapb.StoreState_Up {
+		if store.DownTime() > opt.MaxStoreDownTime.Duration {
+			s.Store.StateName = downStateName
+		} else if store.IsDisconnected() {
+			s.Store.StateName = disconnectedName
+		}
 	}
 	return s
 }
 
-type storesInfo struct {
+// StoresInfo records stores' info.
+type StoresInfo struct {
 	Count  int          `json:"count"`
-	Stores []*storeInfo `json:"stores"`
+	Stores []*StoreInfo `json:"stores"`
 }
 
 type storeHandler struct {
-	svr *server.Server
-	rd  *render.Render
+	*server.Handler
+	rd *render.Render
 }
 
-func newStoreHandler(svr *server.Server, rd *render.Render) *storeHandler {
+func newStoreHandler(handler *server.Handler, rd *render.Render) *storeHandler {
 	return &storeHandler{
-		svr: svr,
-		rd:  rd,
+		Handler: handler,
+		rd:      rd,
 	}
 }
 
 func (h *storeHandler) Get(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
+	cluster := h.GetRaftCluster()
 	if cluster == nil {
 		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
 		return
 	}
 
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
-	store, status, err := cluster.GetStore(storeID)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	store := cluster.GetStore(storeID)
+	if store == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 		return
 	}
 
-	storeInfo := newStoreInfo(store, status)
+	storeInfo := newStoreInfo(h.GetScheduleConfig(), store)
 	h.rd.JSON(w, http.StatusOK, storeInfo)
 }
 
 func (h *storeHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
+	cluster := h.GetRaftCluster()
 	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+		errorResp(h.rd, w, errcode.NewInternalErr(server.ErrNotBootstrapped))
 		return
 	}
 
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
 	_, force := r.URL.Query()["force"]
+	var err error
 	if force {
 		err = cluster.BuryStore(storeID, force)
 	} else {
 		err = cluster.RemoveStore(storeID)
 	}
 
+	if err != nil {
+		errorResp(h.rd, w, err)
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storeHandler) SetState(w http.ResponseWriter, r *http.Request) {
+	cluster := h.GetRaftCluster()
+	if cluster == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+		return
+	}
+
+	vars := mux.Vars(r)
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
+		return
+	}
+
+	stateStr := r.URL.Query().Get("state")
+	state, ok := metapb.StoreState_value[stateStr]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "invalid state")
+		return
+	}
+
+	err := cluster.SetStoreState(storeID, metapb.StoreState(state))
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -154,28 +218,205 @@ func (h *storeHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	h.rd.JSON(w, http.StatusOK, nil)
 }
 
-type storesHandler struct {
-	svr *server.Server
-	rd  *render.Render
-}
-
-func newStoresHandler(svr *server.Server, rd *render.Render) *storesHandler {
-	return &storesHandler{
-		svr: svr,
-		rd:  rd,
-	}
-}
-
-func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
+func (h *storeHandler) SetLabels(w http.ResponseWriter, r *http.Request) {
+	cluster := h.GetRaftCluster()
 	if cluster == nil {
 		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
 		return
 	}
 
-	stores := cluster.GetStores()
-	storesInfo := &storesInfo{
-		Stores: make([]*storeInfo, 0, len(stores)),
+	vars := mux.Vars(r)
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
+		return
+	}
+
+	var input map[string]string
+	if err := readJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	labels := make([]*metapb.StoreLabel, 0, len(input))
+	for k, v := range input {
+		labels = append(labels, &metapb.StoreLabel{
+			Key:   k,
+			Value: v,
+		})
+	}
+
+	if err := config.ValidateLabels(labels); err != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(err))
+		return
+	}
+
+	if err := cluster.UpdateStoreLabels(storeID, labels); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storeHandler) SetWeight(w http.ResponseWriter, r *http.Request) {
+	cluster := h.GetRaftCluster()
+	if cluster == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+		return
+	}
+
+	vars := mux.Vars(r)
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
+		return
+	}
+
+	var input map[string]interface{}
+	if err := readJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	leaderVal, ok := input["leader"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "leader weight unset")
+		return
+	}
+	regionVal, ok := input["region"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "region weight unset")
+		return
+	}
+	leader, ok := leaderVal.(float64)
+	if !ok || leader < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat leader weight")
+		return
+	}
+	region, ok := regionVal.(float64)
+	if !ok || region < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat region weight")
+		return
+	}
+
+	if err := cluster.SetStoreWeight(storeID, leader, region); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storeHandler) SetLimit(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		errorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
+		return
+	}
+
+	var input map[string]interface{}
+	if err := readJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	rateVal, ok := input["rate"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "rate unset")
+		return
+	}
+	rate, ok := rateVal.(float64)
+	if !ok || rate < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat rate")
+		return
+	}
+
+	if err := h.SetStoreLimit(storeID, rate/schedule.StoreBalanceBaseTime); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+type storesHandler struct {
+	*server.Handler
+	rd *render.Render
+}
+
+func newStoresHandler(handler *server.Handler, rd *render.Render) *storesHandler {
+	return &storesHandler{
+		Handler: handler,
+		rd:      rd,
+	}
+}
+
+func (h *storesHandler) RemoveTombStone(w http.ResponseWriter, r *http.Request) {
+	cluster := h.GetRaftCluster()
+	if cluster == nil {
+		errorResp(h.rd, w, errcode.NewInternalErr(server.ErrNotBootstrapped))
+		return
+	}
+
+	err := cluster.RemoveTombStoneRecords()
+	if err != nil {
+		errorResp(h.rd, w, err)
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storesHandler) SetAllLimit(w http.ResponseWriter, r *http.Request) {
+	var input map[string]interface{}
+	if err := readJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	rateVal, ok := input["rate"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "rate unset")
+		return
+	}
+	rate, ok := rateVal.(float64)
+	if !ok || rate < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat rate")
+		return
+	}
+
+	if err := h.SetAllStoresLimit(rate / schedule.StoreBalanceBaseTime); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storesHandler) GetAllLimit(w http.ResponseWriter, r *http.Request) {
+	limit, err := h.GetAllStoresLimit()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ret := make(map[uint64]interface{})
+	for s, l := range limit {
+		ret[s] = struct {
+			Rate float64 `json:"rate"`
+		}{Rate: l * schedule.StoreBalanceBaseTime}
+	}
+
+	h.rd.JSON(w, http.StatusOK, ret)
+}
+
+func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cluster := h.GetRaftCluster()
+	if cluster == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+		return
+	}
+
+	stores := cluster.GetMetaStores()
+	StoresInfo := &StoresInfo{
+		Stores: make([]*StoreInfo, 0, len(stores)),
 	}
 
 	urlFilter, err := newStoreStateFilter(r.URL)
@@ -184,20 +425,21 @@ func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stores = urlFilter.filter(cluster.GetStores())
+	stores = urlFilter.filter(cluster.GetMetaStores())
 	for _, s := range stores {
-		store, status, err := cluster.GetStore(s.GetId())
-		if err != nil {
-			h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		storeID := s.GetId()
+		store := cluster.GetStore(storeID)
+		if store == nil {
+			h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 			return
 		}
 
-		storeInfo := newStoreInfo(store, status)
-		storesInfo.Stores = append(storesInfo.Stores, storeInfo)
+		storeInfo := newStoreInfo(h.GetScheduleConfig(), store)
+		StoresInfo.Stores = append(StoresInfo.Stores, storeInfo)
 	}
-	storesInfo.Count = len(storesInfo.Stores)
+	StoresInfo.Count = len(StoresInfo.Stores)
 
-	h.rd.JSON(w, http.StatusOK, storesInfo)
+	h.rd.JSON(w, http.StatusOK, StoresInfo)
 }
 
 type storeStateFilter struct {
@@ -210,7 +452,7 @@ func newStoreStateFilter(u *url.URL) (*storeStateFilter, error) {
 		for _, s := range v {
 			state, err := strconv.Atoi(s)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, errors.WithStack(err)
 			}
 
 			storeState := metapb.StoreState(state)

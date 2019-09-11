@@ -14,23 +14,23 @@
 package api
 
 import (
+	"context"
 	"net/http"
-	"os"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/pkg/testutil"
 	"github.com/pingcap/pd/server"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
+	"github.com/pingcap/pd/server/config"
 )
 
 var (
-	clusterID = uint64(time.Now().Unix())
-	store     = &metapb.Store{
+	store = &metapb.Store{
 		Id:      1,
 		Address: "localhost",
 	}
@@ -51,6 +51,7 @@ var (
 )
 
 func TestAPIServer(t *testing.T) {
+	server.EnableZap = true
 	TestingT(t)
 }
 
@@ -60,29 +61,34 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-func cleanServer(cfg *server.Config) {
-	// Clean data directory
-	os.RemoveAll(cfg.DataDir)
-}
-
 type cleanUpFunc func()
 
-func mustNewServer(c *C) (*server.Server, cleanUpFunc) {
-	_, svrs, cleanup := mustNewCluster(c, 1)
+func mustNewServer(c *C, opts ...func(cfg *config.Config)) (*server.Server, cleanUpFunc) {
+	_, svrs, cleanup := mustNewCluster(c, 1, opts...)
 	return svrs[0], cleanup
 }
 
-func mustNewCluster(c *C, num int) ([]*server.Config, []*server.Server, cleanUpFunc) {
+var zapLogOnce sync.Once
+
+func mustNewCluster(c *C, num int, opts ...func(cfg *config.Config)) ([]*config.Config, []*server.Server, cleanUpFunc) {
 	svrs := make([]*server.Server, 0, num)
-	cfgs := server.NewTestMultiConfig(num)
+	cfgs := server.NewTestMultiConfig(c, num)
 
 	ch := make(chan *server.Server, num)
 	for _, cfg := range cfgs {
-		go func(cfg *server.Config) {
-			s := server.CreateServer(cfg)
-			e := s.StartEtcd(NewHandler(s))
-			c.Assert(e, IsNil)
-			go s.Run()
+		go func(cfg *config.Config) {
+			err := cfg.SetupLogger()
+			c.Assert(err, IsNil)
+			zapLogOnce.Do(func() {
+				log.ReplaceGlobals(cfg.GetZapLogger(), cfg.GetZapLogProperties())
+			})
+			for _, opt := range opts {
+				opt(cfg)
+			}
+			s, err := server.CreateServer(cfg, NewHandler)
+			c.Assert(err, IsNil)
+			err = s.Run(context.TODO())
+			c.Assert(err, IsNil)
 			ch <- s
 		}(cfg)
 	}
@@ -102,7 +108,7 @@ func mustNewCluster(c *C, num int) ([]*server.Config, []*server.Server, cleanUpF
 			s.Close()
 		}
 		for _, cfg := range cfgs {
-			cleanServer(cfg)
+			testutil.CleanServer(cfg)
 		}
 	}
 
@@ -110,65 +116,37 @@ func mustNewCluster(c *C, num int) ([]*server.Config, []*server.Server, cleanUpF
 }
 
 func mustWaitLeader(c *C, svrs []*server.Server) *server.Server {
-	for i := 0; i < 100; i++ {
+	var leaderServer *server.Server
+	testutil.WaitUntil(c, func(c *C) bool {
+		var leader *pdpb.Member
 		for _, svr := range svrs {
-			if svr.IsLeader() {
-				return svr
+			l := svr.GetLeader()
+			// All servers' GetLeader should return the same leader.
+			if l == nil || (leader != nil && l.GetMemberId() != leader.GetMemberId()) {
+				return false
+			}
+			if leader == nil {
+				leader = l
+			}
+			if leader.GetMemberId() == svr.GetMember().ID() {
+				leaderServer = svr
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	c.Fatal("no leader")
-	return nil
+		return true
+	})
+	return leaderServer
 }
 
-func newRequestHeader(clusterID uint64) *pdpb.RequestHeader {
-	return &pdpb.RequestHeader{
-		ClusterId: clusterID,
-	}
-}
-
-func mustNewGrpcClient(c *C, addr string) pdpb.PDClient {
-	conn, err := grpc.Dial(strings.TrimLeft(addr, "http://"), grpc.WithInsecure())
-
-	c.Assert(err, IsNil)
-	return pdpb.NewPDClient(conn)
-}
 func mustBootstrapCluster(c *C, s *server.Server) {
-	grpcPDClient := mustNewGrpcClient(c, s.GetAddr())
+	grpcPDClient := testutil.MustNewGrpcClient(c, s.GetAddr())
 	req := &pdpb.BootstrapRequest{
-		Header: newRequestHeader(s.ClusterID()),
+		Header: testutil.NewRequestHeader(s.ClusterID()),
 		Store:  store,
 		Region: region,
 	}
 	resp, err := grpcPDClient.Bootstrap(context.Background(), req)
 	c.Assert(err, IsNil)
 	c.Assert(resp.GetHeader().GetError().GetType(), Equals, pdpb.ErrorType_OK)
-}
-
-func mustPutStore(c *C, s *server.Server, store *metapb.Store) {
-	grpcPDClient := mustNewGrpcClient(c, s.GetAddr())
-	req := &pdpb.PutStoreRequest{
-		Header: newRequestHeader(s.ClusterID()),
-		Store:  store,
-	}
-	resp, err := grpcPDClient.PutStore(context.Background(), req)
-	c.Assert(err, IsNil)
-	c.Assert(resp.GetHeader().GetError().GetType(), Equals, pdpb.ErrorType_OK)
-}
-
-func mustRegionHeartBeat(c *C, client pdpb.PD_RegionHeartbeatClient, clusterID uint64, region *server.RegionInfo) {
-	req := &pdpb.RegionHeartbeatRequest{
-		Header: newRequestHeader(clusterID),
-		Region: region.Region,
-		Leader: region.Leader,
-	}
-
-	err := client.Send(req)
-	c.Assert(err, IsNil)
-
-	// Sleep a while to make sure the message is processed by server.
-	time.Sleep(time.Millisecond * 200)
 }
 
 func readJSONWithURL(url string, data interface{}) error {

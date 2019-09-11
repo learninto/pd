@@ -16,11 +16,11 @@ package api
 import (
 	"encoding/json"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/server/config"
 )
 
 var _ = Suite(&testStatusAPISuite{})
@@ -33,31 +33,25 @@ func (s *testStatusAPISuite) SetUpSuite(c *C) {
 	s.hc = newHTTPClient()
 }
 
-func checkStatusResponse(c *C, body []byte, cfgs []*server.Config) {
+func checkStatusResponse(c *C, body []byte, cfgs []*config.Config) {
 	got := status{}
-	json.Unmarshal(body, &got)
+	c.Assert(json.Unmarshal(body, &got), IsNil)
 
 	c.Assert(got.BuildTS, Equals, server.PDBuildTS)
 	c.Assert(got.GitHash, Equals, server.PDGitHash)
 }
 
-func (s *testStatusAPISuite) testStatusInternal(c *C, num int) {
-	cfgs, _, clean := mustNewCluster(c, num)
+func (s *testStatusAPISuite) TestStatus(c *C) {
+	cfgs, _, clean := mustNewCluster(c, 3)
 	defer clean()
 
-	addr := cfgs[rand.Intn(len(cfgs))].ClientUrls + apiPrefix + "/api/v1/status"
-	resp, err := s.hc.Get(addr)
-	c.Assert(err, IsNil)
-	defer resp.Body.Close()
-	buf, err := ioutil.ReadAll(resp.Body)
-	c.Assert(err, IsNil)
-	checkStatusResponse(c, buf, cfgs)
-}
-
-func (s *testStatusAPISuite) TestStatus(c *C) {
-	numbers := []int{1, 3}
-
-	for _, num := range numbers {
-		s.testStatusInternal(c, num)
+	for _, cfg := range cfgs {
+		addr := cfg.ClientUrls + apiPrefix + "/api/v1/status"
+		resp, err := s.hc.Get(addr)
+		c.Assert(err, IsNil)
+		defer resp.Body.Close()
+		buf, err := ioutil.ReadAll(resp.Body)
+		c.Assert(err, IsNil)
+		checkStatusResponse(c, buf, cfgs)
 	}
 }
